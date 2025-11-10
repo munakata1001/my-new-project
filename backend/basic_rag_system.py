@@ -1,10 +1,12 @@
 import os
 from dotenv import load_dotenv
-from langchain.text_splitter import RecursiveCharacterTextSplitter  # pyright: ignore[reportMissingImports]
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
 from langchain_community.vectorstores import Chroma  # pyright: ignore[reportMissingImports]
 from langchain_community.embeddings import HuggingFaceEmbeddings  # pyright: ignore[reportMissingImports]
-from langchain.chains import RetrievalQA  # pyright: ignore[reportMissingImports]
-from langchain_community.llms import OpenAI    # pyright: ignore[reportMissingImports]
+from langchain.chains.retrieval_qa.base import RetrievalQA  # pyright: ignore[reportMissingImports]
+from langchain_google_genai import ChatGoogleGenerativeAI  # pyright: ignore[reportMissingImports]
 from langchain.docstore.document import Document    # pyright: ignore[reportMissingImports]
 load_dotenv()
 
@@ -22,9 +24,10 @@ class SimpleRAG:
         self.vectorstore = None
         
         # LLMの設定
-        self.llm = OpenAI(
+        self.llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-pro-latest",
             temperature=0,
-            openai_api_key=os.getenv("OPENAI_API_KEY")
+            google_api_key=os.getenv("GOOGLE_API_KEY")
         )
         
         print("初期化完了!")
@@ -92,7 +95,11 @@ class PDFRagSystem:
         )
         
         self.vectorstore = None
-        self.llm = OpenAI(temperature=0.3)
+        self.llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-pro-latest",
+            temperature=0.3,
+            google_api_key=os.getenv("GOOGLE_API_KEY")
+        )
         
     def load_pdf(self, pdf_path):
         """PDFファイルを読み込み、ベクトル化"""
