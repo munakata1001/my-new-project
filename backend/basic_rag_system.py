@@ -25,7 +25,7 @@ class SimpleRAG:
         
         # LLMの設定
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-pro-latest",
+            model="gemini-1.5-pro",
             temperature=0,
             google_api_key=os.getenv("GOOGLE_API_KEY")
         )

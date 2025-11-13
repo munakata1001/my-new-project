@@ -23,7 +23,8 @@ export default function Home() {
     });
     
     if (!response.ok) {
-      throw new Error('Network response was not ok');
+      const errorText = await response.text();
+      throw new Error(`Server error: ${response.status} - ${errorText}`);
     }
 
     const data = await response.json();
@@ -31,12 +32,15 @@ export default function Home() {
 
   } catch (error) {
     console.error('Error fetching answer:', error);
-    setAnswer('An error occurred while fetching the answer.');
+    const errorMessage = error instanceof Error 
+      ? `エラー: ${error.message}` 
+      : 'An error occurred while fetching the answer.';
+    setAnswer(errorMessage);
   } finally {
     setIsLoading(false);
   }
 };
-// ... 既存のコード ...
+
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center p-24">
