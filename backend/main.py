@@ -4,8 +4,27 @@ from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from basic_rag_system import SimpleRAG  # 既存のクラスを利用
+import logging
 import os
 import traceback
+
+LOG_LEVEL = os.getenv("RAG_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+DEFAULT_RAG_OVERVIEW = """
+このRAG（Retrieval Augmented Generation）システムは、次の4層で構成されています。
+
+1. フロントエンド: Next.js (App Router) + Tailwind。ユーザーがブラウザ上で質問を送信し、Geminiベースの回答を受け取ります。
+2. APIレイヤー: FastAPI。`/ask` エンドポイントが質問を受け取り、RAGエンジンを呼び出します。CORS設定済みなので `localhost:3000` からアクセスできます。
+3. RAGエンジン: `basic_rag_system.SimpleRAG`。HuggingFaceの `all-MiniLM-L6-v2` で埋め込みを生成し、ChromaベクトルDBに保存、LangChainの `RetrievalQA` を通じて Gemini 2.5 Flash モデルに文脈付きで質問します。
+4. ドキュメント前処理: `advanced_chunking.py` を使ったチャンク分割や Seed 文書のロード機能。アプリ起動時に概要テキストを登録し、質問が来たら関連チャンクを再検索します。
+
+ユーザーが「このRAGシステムについて教えて」と尋ねた場合、上記の構成を説明する回答が返るよう、概要テキストが初期ロードされています。
+"""
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI()
@@ -42,7 +61,7 @@ def startup_event():
     ここでRAGシステムのセットアップを行います。
     """
     global rag_engine
-    print("Loading documents and setting up RAG engine...")
+    logger.info("Starting backend startup workflow")
 
     # SimpleRAG を使った最小セットアップ（テキストを少量投入）
     rag_engine = SimpleRAG()
@@ -50,11 +69,11 @@ def startup_event():
     # 簡易なシード文書（最低限ベクトルDBを初期化して動作確認できるように）
     seed_text = os.getenv(
         "RAG_SEED_TEXT",
-        "これはRAGシステムの接続テスト用のサンプル文書です。GeminiベースのRAGが正しく応答できるかを検証するための短いテキストです。"
+        DEFAULT_RAG_OVERVIEW.strip()
     )
     rag_engine.load_documents([seed_text])
 
-    print("RAG engine setup complete.")
+    logger.info("RAG engine setup complete")
 
 # リクエストボディの型定義
 class QueryRequest(BaseModel):
@@ -101,15 +120,16 @@ async def ask_question(request: QueryRequest):
     """
     try:
         if rag_engine is None:
+            logger.warning("Received query before RAG engine was ready")
             return AnswerResponse(answer="RAG engine is not ready yet.")
         
-        print(f"Received query: {request.query}")
+        logger.info("Received query: %s", request.query)
         
         # RAGエンジンを使って回答を生成
         result = rag_engine.query(request.query)
         response_text = result.get("answer") if isinstance(result, dict) else str(result)
         
-        print(f"Generated answer: {response_text}")
+        logger.info("Generated answer (first 200 chars): %s", response_text[:200])
         
         from fastapi.responses import JSONResponse
         return JSONResponse(
@@ -123,7 +143,7 @@ async def ask_question(request: QueryRequest):
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"Error in ask_question: {error_details}")
+        logger.exception("Error in /ask handler: %s", e)
         from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=500,
@@ -141,7 +161,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     すべての例外をキャッチして、CORSヘッダーを含むエラーレスポンスを返す
     """
     error_details = traceback.format_exc()
-    print(f"Global error handler: {error_details}")
+    logger.exception("Global error handler triggered: %s", exc)
     return JSONResponse(
         status_code=500,
         content={"detail": f"Internal server error: {str(exc)}"},
