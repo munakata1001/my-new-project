@@ -195,9 +195,9 @@ class SimpleRAG:
         try:
             retriever = self.vectorstore.as_retriever(
                 search_type="similarity_score_threshold",
-                search_kwargs={'score_threshold': 0.7, 'k': k}
+                search_kwargs={'score_threshold': 0.6, 'k': k} # しきい値を0.6に緩和
             )
-            logger.info("Using similarity_score_threshold search with threshold=0.7")
+            logger.info("Using similarity_score_threshold search with threshold=0.6")
         except Exception as e:
             logger.warning("Similarity search with threshold failed, falling back to default similarity search: %s", e)
             retriever = self.vectorstore.as_retriever(
@@ -207,28 +207,34 @@ class SimpleRAG:
         qa_chain = RetrievalQA.from_chain_type(
             llm=self.llm,
             chain_type="stuff",
-            retriever=retriever,
+             retriever=retriever,
             return_source_documents=True,
             chain_type_kwargs={"prompt": get_prompt("basic")}
         )
         
         # 質問を実行
         result = qa_chain({"query": question})
-        sources = result["source_documents"]
+        sources = result.get("source_documents", []) # .getを使用してキーが存在しない場合も安全に
+        
+        # 検索結果の件数をログに出力
+        logger.info(
+            "Retrieved %d source documents after filtering by score threshold.",
+            len(sources)
+        )
+
+        # 検索結果が0件の場合のログを追加
+        if not sources:
+            logger.warning(
+                "No documents met the similarity score threshold of 0.7. "
+                "The LLM will receive no context for this query. "
+                "Consider lowering the threshold if this happens frequently for valid questions."
+            )
+
         logger.info(
             "Generated answer (retrieved %d source docs)",
             len(sources),
         )
-        if sources:
-            # ソースドキュメントの詳細をログに記録
-            for i, source in enumerate(sources[:3]):  # 上位3件をログに記録
-                source_preview = source.page_content[:500].replace('\n', ' ')
-                source_metadata = source.metadata if hasattr(source, 'metadata') else {}
-                logger.info(
-                    "Source %d (length: %d, metadata: %s):\n%s...",
-                    i + 1, len(source.page_content), source_metadata, source_preview
-                )
-            logger.debug("Top source preview: %s", sources[0].page_content[:200])
+        logger.debug("Top source preview: %s", sources[0].page_content[:200])
         
         return {
             "answer": result["result"],
