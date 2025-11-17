@@ -19,11 +19,16 @@ class SimpleRAG:
         """RAGシステムの初期化"""
         logger.info("Initializing SimpleRAG")
         
-        # Embeddingモデルの設定(無料・ローカル)
+        # 埋め込みモデルを日本語対応の高性能なものに変更
+        model_name = "intfloat/multilingual-e5-base"
+        logger.info("Using embedding model: %s", model_name)
+        model_kwargs = {'device': 'cpu'}
+        encode_kwargs = {'normalize_embeddings': False}
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
+            model_name=model_name,
+            model_kwargs=model_kwargs,
+            encode_kwargs=encode_kwargs
         )
-        
         # Vector Storeの設定
         self.vectorstore = None
         
@@ -52,30 +57,157 @@ class SimpleRAG:
         splits = text_splitter.split_documents(documents)
         logger.info("Chunked into %d pieces", len(splits))
         
-        # ベクトルDBに保存
-        self.vectorstore = Chroma.from_documents(
-            documents=splits,
-            embedding=self.embeddings,
-            persist_directory="./chroma_db"
-        )
-        logger.info("Vector store persisted to ./chroma_db")
+        # 既存のベクトルストアがある場合は読み込む、なければ新規作成
+        persist_dir = "./chroma_db"
+        if os.path.exists(persist_dir) and os.path.exists(os.path.join(persist_dir, "chroma.sqlite3")):
+            try:
+                logger.info("Loading existing vector store from %s", persist_dir)
+                self.vectorstore = Chroma(
+                    persist_directory=persist_dir,
+                    embedding_function=self.embeddings
+                )
+                # 既存のストアにドキュメントを追加
+                if splits:
+                    self.vectorstore.add_documents(splits)
+                    logger.info("Added %d new documents to existing vector store", len(splits))
+            except Exception as e:
+                logger.warning("Failed to load existing vector store, creating new one: %s", e)
+                self.vectorstore = Chroma.from_documents(
+                    documents=splits,
+                    embedding=self.embeddings,
+                    persist_directory=persist_dir
+                )
+        else:
+            # 新規作成
+            self.vectorstore = Chroma.from_documents(
+                documents=splits,
+                embedding=self.embeddings,
+                persist_directory=persist_dir
+            )
+            logger.info("Created new vector store at %s", persist_dir)
+        
+        logger.info("Vector store ready at ./chroma_db")
+        
+        # ベクトルストアの内容を確認（デバッグ用）
+        if self.vectorstore is not None:
+            try:
+                # ベクトルストア内のドキュメント数を取得
+                collection = self.vectorstore._collection
+                if collection:
+                    count = collection.count()
+                    logger.info("Vector store contains %d documents", count)
+            except Exception as e:
+                logger.debug("Could not get vector store count: %s", e)
     
-    def query(self, question, k=3):
+    def add_documents(self, documents):
+        """既存のベクトルストアにドキュメントを追加"""
+        if self.vectorstore is None:
+            logger.warning("Vector store not initialized, creating new one")
+            self.vectorstore = Chroma.from_documents(
+                documents=documents,
+                embedding=self.embeddings,
+                persist_directory="./chroma_db"
+            )
+        else:
+            logger.info("Adding %d documents to existing vector store", len(documents))
+            # テキストを分割(チャンク化)
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,
+                chunk_overlap=50,
+                length_function=len,
+            )
+            splits = text_splitter.split_documents(documents)
+            logger.info("Chunked into %d pieces", len(splits))
+            
+            # 既存のベクトルストアに追加
+            self.vectorstore.add_documents(splits)
+            # 永続化を明示的に実行（persist_directoryが設定されている場合は自動永続化される）
+            try:
+                if hasattr(self.vectorstore, 'persist'):
+                    self.vectorstore.persist()
+                    logger.debug("Vector store explicitly persisted")
+            except Exception as e:
+                logger.debug("Persist method not available or failed: %s", e)
+            
+            # 追加後のドキュメント数を確認
+            try:
+                collection = self.vectorstore._collection
+                if collection:
+                    count = collection.count()
+                    logger.info("Documents added to vector store. Total documents: %d", count)
+            except Exception as e:
+                logger.debug("Could not get vector store count after adding: %s", e)
+                logger.info("Documents added to vector store and persisted")
+    
+    def query(self, question, k=5):
         """質問に対して回答を生成"""
         if self.vectorstore is None:
             logger.warning("Query attempted before documents were loaded")
             return {"error": "ドキュメントが読み込まれていません"}
         
         logger.info("New query received: %s", question)
-        logger.debug("Running similarity search with k=%d", k)
+        logger.info("Running similarity search with k=%d", k)
+        
+        # まず、直接検索を実行して結果を確認
+        try:
+            retriever = self.vectorstore.as_retriever(search_kwargs={"k": k})
+            retrieved_docs = retriever.get_relevant_documents(question)
+            logger.info("=" * 80)
+            logger.info("DIRECT SEARCH RESULTS (before LLM processing)")
+            logger.info("=" * 80)
+            logger.info("Direct search retrieved %d documents for query: '%s'", len(retrieved_docs), question)
+            
+            # 検索結果の詳細をログに記録
+            for i, doc in enumerate(retrieved_docs):
+                content_preview = doc.page_content[:800].replace('\n', ' ')
+                metadata = doc.metadata if hasattr(doc, 'metadata') else {}
+                logger.info("-" * 80)
+                logger.info("Retrieved doc %d/%d (length: %d chars, metadata: %s):", 
+                           i + 1, len(retrieved_docs), len(doc.page_content), metadata)
+                logger.info("Content preview: %s", content_preview)
+                logger.info("-" * 80)
+            
+            # 質問に関連するキーワードが含まれているか確認（日本語の単語分割を改善）
+            import re
+            # 日本語の文字列を単語に分割（より適切な方法）
+            question_words = re.findall(r'[\w]+|[\u3040-\u309F]+|[\u30A0-\u30FF]+', question.lower())
+            question_keywords = set(question_words)
+            logger.info("Checking if retrieved documents contain question keywords: %s", question_keywords)
+            for i, doc in enumerate(retrieved_docs):
+                doc_lower = doc.page_content.lower()
+                matching_keywords = [kw for kw in question_keywords if kw in doc_lower]
+                logger.info("Doc %d: Contains %d/%d keywords: %s", 
+                           i + 1, len(matching_keywords), len(question_keywords), matching_keywords)
+            
+            # 検索結果に質問に関連する内容が含まれていない場合の警告
+            if not any(len([kw for kw in question_keywords if kw in doc.page_content.lower()]) > 0 for doc in retrieved_docs):
+                logger.warning("WARNING: None of the retrieved documents contain question keywords!")
+                logger.warning("This suggests the search may not be finding relevant documents.")
+                logger.warning("Consider: 1) Checking if the data is in the vector store")
+                logger.warning("          2) Using different search parameters")
+                logger.warning("          3) Trying hybrid search (keyword + vector)")
+            logger.info("=" * 80)
+        except Exception as e:
+            logger.exception("Error in direct search: %s", e)
         
         # RetrievalQAチェーンの作成
+        # MMR (Maximum Marginal Relevance) 検索を試す（多様性を確保）
+        try:
+            retriever = self.vectorstore.as_retriever(
+                search_type="similarity_score_threshold",
+                search_kwargs={'score_threshold': 0.7, 'k': k}
+            )
+            logger.info("Using similarity_score_threshold search with threshold=0.7")
+        except Exception as e:
+            logger.warning("Similarity search with threshold failed, falling back to default similarity search: %s", e)
+            retriever = self.vectorstore.as_retriever(
+                search_kwargs={"k": k}
+            )
+        
         qa_chain = RetrievalQA.from_chain_type(
             llm=self.llm,
             chain_type="stuff",
-            retriever=self.vectorstore.as_retriever(
-                search_kwargs={"k": k}
-            ),
+            retriever=retriever,
             return_source_documents=True,
             chain_type_kwargs={"prompt": get_prompt("basic")}
         )
@@ -88,6 +220,14 @@ class SimpleRAG:
             len(sources),
         )
         if sources:
+            # ソースドキュメントの詳細をログに記録
+            for i, source in enumerate(sources[:3]):  # 上位3件をログに記録
+                source_preview = source.page_content[:500].replace('\n', ' ')
+                source_metadata = source.metadata if hasattr(source, 'metadata') else {}
+                logger.info(
+                    "Source %d (length: %d, metadata: %s):\n%s...",
+                    i + 1, len(source.page_content), source_metadata, source_preview
+                )
             logger.debug("Top source preview: %s", sources[0].page_content[:200])
         
         return {
