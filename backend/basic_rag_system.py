@@ -1,5 +1,9 @@
 import logging
 import os
+import re
+from pathlib import Path
+from typing import List
+
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -9,10 +13,25 @@ from langchain_community.embeddings import HuggingFaceEmbeddings  # pyright: ign
 from langchain.chains.retrieval_qa.base import RetrievalQA  # pyright: ignore[reportMissingImports]
 from langchain_google_genai import ChatGoogleGenerativeAI  # pyright: ignore[reportMissingImports]
 from langchain.docstore.document import Document    # pyright: ignore[reportMissingImports]
+from langchain_core.retrievers import BaseRetriever  # pyright: ignore[reportMissingImports]
+
 from prompt_templates import get_prompt  # pyright: ignore[reportMissingImports]
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+class StaticRetriever(BaseRetriever):
+    """Returns a precomputed set of documents for a given query."""
+
+    documents: List[Document]
+
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        return self.documents
+
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        return self.documents
+
 
 class SimpleRAG:
     def __init__(self):
@@ -50,8 +69,8 @@ class SimpleRAG:
         
         # テキストを分割(チャンク化)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
+            chunk_size=300,
+            chunk_overlap=80,
             length_function=len,
         )
         splits = text_splitter.split_documents(documents)
@@ -112,8 +131,8 @@ class SimpleRAG:
             logger.info("Adding %d documents to existing vector store", len(documents))
             # テキストを分割(チャンク化)
             text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,
-                chunk_overlap=50,
+                chunk_size=300,
+                chunk_overlap=80,
                 length_function=len,
             )
             splits = text_splitter.split_documents(documents)
@@ -190,54 +209,154 @@ class SimpleRAG:
         except Exception as e:
             logger.exception("Error in direct search: %s", e)
         
-        # RetrievalQAチェーンの作成
-        # MMR (Maximum Marginal Relevance) 検索を試す（多様性を確保）
+        # 多様な検索手法を組み合わせて文脈を収集
+        combined_docs: List[Document] = []
+        seen_keys = set()
+        use_threshold = False
+        query_variants = [question]
+
+        tokens = re.findall(r"[一-龯ぁ-んァ-ヶA-Za-z0-9]+", question)
+        for token in tokens:
+            if len(token) >= 2:
+                variant = f"{token} 術式 技 能力 詳細"
+                if variant not in query_variants:
+                    query_variants.append(variant)
+        expanded_query = f"{question} 術式 技 能力 詳解"
+        if expanded_query not in query_variants:
+            query_variants.append(expanded_query)
+
+        def dedup_and_append(docs: List[Document], method: str):
+            for doc in docs:
+                content = (doc.page_content or "").strip()
+                if not content:
+                    continue
+                metadata = getattr(doc, "metadata", {}) or {}
+                doc.metadata = metadata
+                metadata.setdefault("retrieval_method", method)
+                key = (
+                    metadata.get("source"),
+                    metadata.get("file_name"),
+                    metadata.get("page"),
+                    content[:160],
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                combined_docs.append(doc)
+
+        threshold_docs: List[Document] = []
+        for variant in query_variants:
+            try:
+                threshold_retriever = self.vectorstore.as_retriever(
+                    search_type="similarity_score_threshold",
+                    search_kwargs={'score_threshold': 0.5, 'k': k}
+                )
+                docs = threshold_retriever.get_relevant_documents(variant)
+                if docs:
+                    use_threshold = True
+                    logger.info(
+                        "Threshold search (0.5) retrieved %d docs for variant '%s'",
+                        len(docs), variant
+                    )
+                    dedup_and_append(docs, f"threshold:{variant}")
+                    threshold_docs.extend(docs)
+                if len(combined_docs) >= max(k * 2, 10):
+                    break
+            except Exception as e:
+                logger.warning("Threshold search failed for variant '%s': %s", variant, e)
+
+        if not threshold_docs:
+            for variant in query_variants:
+                try:
+                    similarity_retriever = self.vectorstore.as_retriever(search_kwargs={"k": k})
+                    similarity_docs = similarity_retriever.get_relevant_documents(variant)
+                    logger.info("Standard similarity search retrieved %d docs for variant '%s'", len(similarity_docs), variant)
+                    dedup_and_append(similarity_docs, f"similarity:{variant}")
+                    if len(combined_docs) >= max(k * 2, 10):
+                        break
+                except Exception as e:
+                    logger.warning("Standard similarity search failed for variant '%s': %s", variant, e)
+
+        # MMRを用いて多様性の高い文脈を追加
         try:
-            retriever = self.vectorstore.as_retriever(
-                search_type="similarity_score_threshold",
-                search_kwargs={'score_threshold': 0.6, 'k': k} # しきい値を0.6に緩和
+            mmr_retriever = self.vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": max(k, 5), "fetch_k": max(10, k * 2), "lambda_mult": 0.5}
             )
-            logger.info("Using similarity_score_threshold search with threshold=0.6")
+            for variant in query_variants[:3]:
+                mmr_docs = mmr_retriever.get_relevant_documents(variant)
+                logger.info("MMR search retrieved %d docs for variant '%s'", len(mmr_docs), variant)
+                dedup_and_append(mmr_docs, f"mmr:{variant}")
+                if len(combined_docs) >= max(k * 2, 10):
+                    break
         except Exception as e:
-            logger.warning("Similarity search with threshold failed, falling back to default similarity search: %s", e)
-            retriever = self.vectorstore.as_retriever(
-                search_kwargs={"k": k}
-            )
-        
+            logger.warning("MMR search failed: %s", e)
+
+        # 追加の類似度検索で不足分を補完
+        if len(combined_docs) < k:
+            for variant in query_variants:
+                try:
+                    extra_docs = self.vectorstore.similarity_search(variant, k=k)
+                    logger.info("Extra similarity search added %d docs for variant '%s'", len(extra_docs), variant)
+                    dedup_and_append(extra_docs, f"similarity_extra:{variant}")
+                except Exception as e:
+                    logger.warning("Extra similarity search failed for variant '%s': %s", variant, e)
+                if len(combined_docs) >= max(k * 2, 10):
+                    break
+
+        max_docs = max(k, 6)
+        selected_docs = combined_docs[:max_docs]
+
+        if not selected_docs:
+            logger.warning("No documents available after combined retrieval. Returning empty context.")
+
+        static_retriever = StaticRetriever(documents=selected_docs)
         qa_chain = RetrievalQA.from_chain_type(
             llm=self.llm,
             chain_type="stuff",
-             retriever=retriever,
+            retriever=static_retriever,
             return_source_documents=True,
             chain_type_kwargs={"prompt": get_prompt("basic")}
         )
         
         # 質問を実行
         result = qa_chain({"query": question})
-        sources = result.get("source_documents", []) # .getを使用してキーが存在しない場合も安全に
+        sources = result.get("source_documents", selected_docs)
         
-        # 検索結果の件数をログに出力
         logger.info(
-            "Retrieved %d source documents after filtering by score threshold.",
-            len(sources)
-        )
-
-        # 検索結果が0件の場合のログを追加
-        if not sources:
-            logger.warning(
-                "No documents met the similarity score threshold of 0.7. "
-                "The LLM will receive no context for this query. "
-                "Consider lowering the threshold if this happens frequently for valid questions."
-            )
-
-        logger.info(
-            "Generated answer (retrieved %d source docs)",
+            "Generated answer (retrieved %d source docs, threshold used: %s)",
             len(sources),
+            use_threshold,
         )
-        logger.debug("Top source preview: %s", sources[0].page_content[:200])
+        if sources:
+            logger.debug("Top source preview: %s", sources[0].page_content[:200])
+        
+        final_answer = result["result"].strip() if isinstance(result, dict) else str(result).strip()
+        if sources:
+            reference_lines = []
+            seen_keys = set()
+            for idx, doc in enumerate(sources, 1):
+                metadata = getattr(doc, "metadata", {}) or {}
+                file_name = metadata.get("file_name")
+                source_path = metadata.get("source")
+                page_info = metadata.get("page")
+                if not file_name and source_path:
+                    file_name = Path(source_path).name
+                source_label = file_name or (source_path or f"Document {idx}")
+                if page_info is not None:
+                    source_label += f" (page {page_info})"
+                snippet = (doc.page_content or "").replace("\n", " ").strip()
+                snippet = snippet[:160] + ("..." if len(snippet) > 160 else "")
+                key = (source_label, snippet)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                reference_lines.append(f"- {source_label}: {snippet}")
+            if reference_lines:
+                final_answer = f"{final_answer}\n\n参考情報:\n" + "\n".join(reference_lines)
         
         return {
-            "answer": result["result"],
+            "answer": final_answer,
             "sources": sources
         }
 
