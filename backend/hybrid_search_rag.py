@@ -79,7 +79,7 @@ class ReRankingRAG:
         self, 
         query: str, 
         documents: List,
-        top_k: int = 4
+        top_k: int = 6
     ) -> List[Tuple]:
         """文書を再ランキング"""
         # 質問と各文書のペアを作成
